@@ -1,0 +1,4 @@
+streamlit>=1.36
+pymupdf>=1.23
+pandas>=2.2
+openpyxl>=3.1
