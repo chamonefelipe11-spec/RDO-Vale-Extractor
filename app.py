@@ -8,7 +8,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Extrator RDO", page_icon="🧰", layout="wide")
 st.title("🧰 Extrator de RDO (PDF → Excel)")
-st.caption("Extrai MÃO DE OBRA entre os blocos do RDO e gera planilha exatamente no layout desejado.")
+st.caption("Extrai o bloco de MÃO DE OBRA exatamente como no script original (blocos de números em linhas separadas).")
 
 with st.sidebar:
     st.header("Entrada")
@@ -16,154 +16,116 @@ with st.sidebar:
         "Selecione 1 ou mais PDFs",
         type=["pdf"],
         accept_multiple_files=True,
-        help="Arraste e solte ou clique para escolher"
     )
     nome_excel = st.text_input("Nome do arquivo Excel (sem extensão)", value="rdo_consolidado")
     st.markdown("---")
-    st.caption("Linhas fora do padrão vão para a aba **Inconsistencias**.")
+    st.caption("Linhas que não aderirem ao padrão irão para a aba **Inconsistencias**.")
 
-# -------- Utils --------
+# ---------- Utils ----------
 def _texto_pdf(file_like: bytes) -> str:
     with fitz.open(stream=file_like, filetype="pdf") as doc:
-        # texto simples por página
         return "\n".join(page.get_text() for page in doc)
 
 def _norm(s: str) -> str:
-    """Uppercase sem acento para buscas robustas."""
     s = unicodedata.normalize("NFD", s)
     s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
     return s.upper()
 
 def _recorta_bloco(texto: str) -> str | None:
-    """Recorta o trecho entre MÃO DE OBRA e EQUIPAMENTO (tolerante a variações)."""
+    """Recorta trecho entre 'RECURSOS EM OPERAÇÃO MÃO DE OBRA' e 'RECURSOS EM OPERAÇÃO EQUIPAMENTO' (robusto a variações)."""
     tnorm = _norm(texto)
-    anchors = [
+    starts = [
         "RECURSOS EM OPERACAO MAO DE OBRA",
         "RECURSOS EM OPERACAO - MAO DE OBRA",
         "RECURSOS DE OPERACAO MAO DE OBRA",
     ]
-    enders = [
+    ends = [
         "RECURSOS EM OPERACAO EQUIPAMENTO",
         "RECURSOS EM OPERACAO - EQUIPAMENTO",
         "RECURSOS DE OPERACAO EQUIPAMENTO",
     ]
-    start = -1
-    for a in anchors:
-        start = tnorm.find(a)
-        if start != -1:
-            break
-    if start == -1:
+    s = next((tnorm.find(x) for x in starts if tnorm.find(x) != -1), -1)
+    if s == -1:
         return None
-
-    end = -1
-    for b in enders:
-        end = tnorm.find(b, start + 1)
-        if end != -1:
-            break
-    if end == -1 or end <= start:
+    e = next((tnorm.find(x, s + 1) for x in ends if tnorm.find(x, s + 1) != -1), -1)
+    if e == -1 or e <= s:
         return None
-
-    # recorta usando os índices do texto normalizado
-    # para manter os caracteres originais, fazemos proporção aproximada
+    # volta para o texto original por proporção
     ratio = len(texto) / max(len(tnorm), 1)
-    s0 = int(start * ratio)
-    e0 = int(end * ratio)
-    return texto[s0:e0]
+    return texto[int(s * ratio): int(e * ratio)]
 
-# -------- Parser robusto --------
+# ---------- Parser (igual à lógica do original) ----------
 def _parse_bloco_mao_de_obra(texto: str) -> list[dict]:
     bloco = _recorta_bloco(texto)
     if not bloco:
         return []
 
-    linhas = [l.strip() for l in bloco.splitlines() if l.strip()]
+    linhas = [l.strip() for l in bloco.splitlines()]
 
-    # filtros de cabeçalho/total
-    filtros = [
-        r"^FUN(C|Ç)AO$",
-        r"^FRENTE( DE OBR(A|A) .*|)$",
-        r"^CLASSIFICA(C|Ç)AO$",
-        r"^EM OPERACAO$",
-        r"^FISCALIZADO$",
-        r"^MANHA|^TARDE|^NOITE$",
-        r"TOTAL",
-    ]
-    filtros_re = [re.compile(pat, re.IGNORECASE) for pat in filtros]
+    # remove cabeçalhos/linhas inúteis (igual ao script original)
+    ignorar = {
+        "Frente de Obra", "Classificação", "Função",
+        "Manhã", "Tarde", "Noite", "Em Operação", "Fiscalizado", "Geral", "Contratado"
+    }
+    linhas = [l for l in linhas if l and l not in ignorar and "TOTAL" not in l.upper()]
 
-    def _eh_cabecalho(l: str) -> bool:
-        ln = _norm(l)
-        return any(r.search(ln) for r in filtros_re)
+    dados = []
+    i = 0
+    while i < len(linhas) - 6:
+        # junta sequência de linhas estritamente numéricas
+        bloco_numeros = []
+        j = i
+        while j < len(linhas) and re.fullmatch(r"\d+", linhas[j]):
+            bloco_numeros.append(int(linhas[j]))
+            j += 1
 
-    registros = []
-    for l in linhas:
-        if _eh_cabecalho(l):
-            continue
+        if len(bloco_numeros) >= 6:
+            # retrocede para achar a Classificação (Direto/Indireto),
+            # pega Frente na linha anterior e Função nas linhas entre a Classificação e os números
+            classificacao = ""
+            frente = ""
+            funcao_linhas = []
+            achou = False
+            for k in range(i - 1, -1, -1):
+                lk = linhas[k].strip()
+                if lk in ("Direto", "Indireto", "DIRETO", "INDIRETO"):
+                    classificacao = "Direto" if "DIRETO" in lk.upper() else "Indireto"
+                    frente = linhas[k - 1].strip() if k - 1 >= 0 else ""
+                    funcao_linhas = [x.strip() for x in linhas[k + 1:i] if x.strip()]
+                    achou = True
+                    break
+            # fallback se não achar
+            if not achou:
+                classificacao = ""
+                frente = "FRENTE DE OBRA ÚNICA"
+                funcao_linhas = [x.strip() for x in linhas[max(0, i - 3):i] if x.strip()]
 
-        # pega TODAS as ocorrências de números na linha
-        nums_iter = list(re.finditer(r"\d+", l))
-        if len(nums_iter) < 7:
-            registros.append({"raw_line": l})
-            continue
+            funcao = " ".join(funcao_linhas).strip() or (funcao_linhas[0] if funcao_linhas else "")
 
-        # usa os 7 últimos números => contratado, EOM, FM, EOT, FT, EON, FN
-        last7 = nums_iter[-7:]
-        # início do primeiro desses 7 números => separa texto/nums
-        cut = last7[0].start()
-        texto_esq = l[:cut].rstrip()
+            # pad para 7 números (contratado + 6 turnos)
+            while len(bloco_numeros) < 7:
+                bloco_numeros.append(0)
 
-        # números na ordem desejada
-        n = [int(m.group()) for m in last7]
-        contratado, eom, fm, eot, ft, eon, fn = n
+            dados.append({
+                "Função": funcao,
+                "Frente de Obra": frente,
+                "Classificação": classificacao,
+                "Contratado Geral": bloco_numeros[0],
+                "Em operação (manhã)": bloco_numeros[1],
+                "Fiscalizado (manhã)": bloco_numeros[2],
+                "Em operação (tarde)": bloco_numeros[3],
+                "Fiscalizado (tarde)": bloco_numeros[4],
+                "Em operação (noite)": bloco_numeros[5],
+                "Fiscalizado (noite)": bloco_numeros[6],
+            })
 
-        # quebra os 3 campos textuais por blocos de 2+ espaços/tabs
-        partes = [p.strip() for p in re.split(r"[ \t]{2,}", texto_esq) if p.strip()]
-
-        classificacao = ""
-        frente = ""
-        funcao = ""
-
-        # heurísticas
-        for p in partes:
-            up = _norm(p)
-            if not classificacao and "DIRETO" in up:
-                classificacao = "Direto"
-                continue
-            if not classificacao and "INDIRETO" in up:
-                classificacao = "Indireto"
-                continue
-            if not frente and "FRENTE" in up:
-                frente = p
-                continue
-
-        # função = o restante “mais descritivo”
-        restantes = [p for p in partes if p not in {classificacao, frente} and p]
-        if restantes:
-            # pega o mais longo como função
-            funcao = max(restantes, key=len)
+            i = j  # pula para depois do bloco numérico
         else:
-            # fallback: primeira parte da linha
-            funcao = partes[0] if partes else texto_esq
+            i += 1
 
-        if not frente:
-            frente = "FRENTE DE OBRA ÚNICA"
+    return dados
 
-        reg = {
-            "Função": funcao,
-            "Frente de Obra": frente,
-            "Classificação": classificacao,
-            "Contratado Geral": contratado,
-            "Em operação (manhã)": eom,
-            "Fiscalizado (manhã)": fm,
-            "Em operação (tarde)": eot,
-            "Fiscalizado (tarde)": ft,
-            "Em operação (noite)": eon,
-            "Fiscalizado (noite)": fn,
-        }
-        registros.append(reg)
-
-    return registros
-
-# -------- Pipeline --------
+# ---------- Pipeline ----------
 def processar_arquivos(files):
     linhas, inconsistencias = [], []
     for f in files:
@@ -171,14 +133,10 @@ def processar_arquivos(files):
             texto = _texto_pdf(f.read())
             dados = _parse_bloco_mao_de_obra(texto)
             if not dados:
-                inconsistencias.append({"Nome do Arquivo": f.name, "Linha": "[BLOCO NÃO ENCONTRADO]"})
-                continue
+                inconsistencias.append({"Nome do Arquivo": f.name, "Linha": "[BLOCO NÃO ENCONTRADO OU SEM PADRÃO]"})
             for row in dados:
-                if "raw_line" in row:
-                    inconsistencias.append({"Nome do Arquivo": f.name, "Linha": row["raw_line"]})
-                else:
-                    row["Nome do Arquivo"] = f.name
-                    linhas.append(row)
+                row["Nome do Arquivo"] = f.name
+                linhas.append(row)
         except Exception as e:
             inconsistencias.append({"Nome do Arquivo": f.name, "Linha": f"[ERRO] {e}"})
 
@@ -200,7 +158,7 @@ def processar_arquivos(files):
     df_incons = pd.DataFrame(inconsistencias)
     return df, df_incons
 
-# -------- UI --------
+# ---------- UI ----------
 col1, col2 = st.columns([1, 2])
 with col1:
     executar = st.button("🚀 Extrair", type="primary", use_container_width=True, disabled=not arquivos)
@@ -217,7 +175,7 @@ if executar:
     st.dataframe(df, use_container_width=True, hide_index=True)
 
     if not df_incons.empty:
-        with st.expander("Inconsistências / linhas não parseadas", expanded=False):
+        with st.expander("Inconsistências / linhas não parseadas"):
             st.dataframe(df_incons, use_container_width=True, hide_index=True)
 
     # exporta
@@ -236,4 +194,4 @@ if executar:
     )
 
 st.markdown("---")
-st.caption("Se ainda vier vazio, me manda 1 PDF de exemplo (sem dados sensíveis) que eu ajusto o parser exatamente para o seu layout.")
+st.caption("Parser replica a lógica do app desktop (sequências de números em linhas separadas, com backtracking para Classificação/Frente/Função).")
