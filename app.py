@@ -1,4 +1,8 @@
 # app.py
+# -*- coding: utf-8 -*-
+# Extrai RDO (Mão de Obra + Equipamentos) no estilo do seu script Colab,
+# consolidando tudo em uma única planilha.
+
 import io
 import re
 import unicodedata
@@ -6,22 +10,18 @@ import fitz  # PyMuPDF
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="Extrator RDO", page_icon="🧰", layout="wide")
+st.set_page_config(page_title="Extrator RDO (Mão de Obra + Equipamentos)", page_icon="🧰", layout="wide")
 st.title("🧰 Extrator de RDO (PDF → Excel)")
-st.caption("Extrai o bloco de MÃO DE OBRA exatamente como no script original (blocos de números em linhas separadas).")
+st.caption("Replica a lógica do seu script: números em linhas separadas, backtracking de classificação/frente e mapeamento específico para Equipamentos.")
 
 with st.sidebar:
     st.header("Entrada")
-    arquivos = st.file_uploader(
-        "Selecione 1 ou mais PDFs",
-        type=["pdf"],
-        accept_multiple_files=True,
-    )
-    nome_excel = st.text_input("Nome do arquivo Excel (sem extensão)", value="rdo_consolidado")
+    arquivos = st.file_uploader("Selecione 1 ou mais PDFs", type=["pdf"], accept_multiple_files=True)
+    nome_excel = st.text_input("Nome do arquivo Excel (sem extensão)", value="RDO_CONSOLIDADO")
     st.markdown("---")
-    st.caption("Linhas que não aderirem ao padrão irão para a aba **Inconsistencias**.")
+    st.caption("Linhas fora do padrão vão para a aba **Inconsistencias**.")
 
-# ---------- Utils ----------
+# -------- Utils --------
 def _texto_pdf(file_like: bytes) -> str:
     with fitz.open(stream=file_like, filetype="pdf") as doc:
         return "\n".join(page.get_text() for page in doc)
@@ -31,134 +31,201 @@ def _norm(s: str) -> str:
     s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
     return s.upper()
 
-def _recorta_bloco(texto: str) -> str | None:
-    """Recorta trecho entre 'RECURSOS EM OPERAÇÃO MÃO DE OBRA' e 'RECURSOS EM OPERAÇÃO EQUIPAMENTO' (robusto a variações)."""
+def extrair_data_rdo(texto_completo: str) -> str:
+    """Copia a sua lógica: usa a linha 11 do arquivo (index 10) como data, com fallback simples."""
+    try:
+        linhas = texto_completo.splitlines()
+        data = linhas[10].strip()
+        return data if data else "Data não encontrada"
+    except IndexError:
+        # fallback: tenta dd/mm/aaaa em qualquer lugar do topo
+        m = re.search(r"\b(\d{2}/\d{2}/\d{4})\b", "\n".join(linhas[:30]) if 'linhas' in locals() else texto_completo[:1000])
+        return m.group(1) if m else "Data não encontrada"
+
+def _recorta_bloco(texto: str, tipo: str) -> str | None:
+    """
+    Recorta trecho entre:
+      - Mão de Obra: 'RECURSOS EM OPERAÇÃO MÃO DE OBRA' → 'RECURSOS EM OPERAÇÃO EQUIPAMENTO'
+      - Equipamento: 'RECURSOS EM OPERAÇÃO EQUIPAMENTO' → 'ASSINATURAS' (ou fim do doc se não achar)
+    Robusto a variações e acentos.
+    """
     tnorm = _norm(texto)
-    starts = [
-        "RECURSOS EM OPERACAO MAO DE OBRA",
-        "RECURSOS EM OPERACAO - MAO DE OBRA",
-        "RECURSOS DE OPERACAO MAO DE OBRA",
-    ]
-    ends = [
-        "RECURSOS EM OPERACAO EQUIPAMENTO",
-        "RECURSOS EM OPERACAO - EQUIPAMENTO",
-        "RECURSOS DE OPERACAO EQUIPAMENTO",
-    ]
+
+    if tipo == "Mão de Obra":
+        starts = [
+            "RECURSOS EM OPERACAO MAO DE OBRA",
+            "RECURSOS EM OPERACAO - MAO DE OBRA",
+            "RECURSOS DE OPERACAO MAO DE OBRA",
+        ]
+        ends = [
+            "RECURSOS EM OPERACAO EQUIPAMENTO",
+            "RECURSOS EM OPERACAO - EQUIPAMENTO",
+            "RECURSOS DE OPERACAO EQUIPAMENTO",
+        ]
+    else:  # Equipamento
+        starts = [
+            "RECURSOS EM OPERACAO EQUIPAMENTO",
+            "RECURSOS EM OPERACAO - EQUIPAMENTO",
+            "RECURSOS DE OPERACAO EQUIPAMENTO",
+        ]
+        ends = [
+            "ASSINATURAS",
+            "ASSINATURA",
+            "RESPONSAVEL",
+            "RESPONSÁVEL",
+            "OBSERVACOES",
+            "OBSERVAÇÕES",
+        ]
+
     s = next((tnorm.find(x) for x in starts if tnorm.find(x) != -1), -1)
     if s == -1:
         return None
+
     e = next((tnorm.find(x, s + 1) for x in ends if tnorm.find(x, s + 1) != -1), -1)
     if e == -1 or e <= s:
-        return None
+        # se não achar o fim em Equipamentos, recorta até o fim do texto
+        e = len(tnorm)
+
     # volta para o texto original por proporção
     ratio = len(texto) / max(len(tnorm), 1)
     return texto[int(s * ratio): int(e * ratio)]
 
-# ---------- Parser (igual à lógica do original) ----------
-def _parse_bloco_mao_de_obra(texto: str) -> list[dict]:
-    bloco = _recorta_bloco(texto)
+# -------- Parser (copiando a "pegada" do seu Colab) --------
+HEADERS_TO_IGNORE = {
+    "Frente de Obra", "Classificação", "Função",
+    "Manhã", "Tarde", "Noite", "Em Operação", "Fiscalizado", "Geral", "Contratado"
+}
+
+def _parse_secao(texto_completo: str, nome_arquivo: str, tipo: str) -> list[dict] | None:
+    bloco = _recorta_bloco(texto_completo, tipo)
     if not bloco:
         return []
 
+    data_rdo = extrair_data_rdo(texto_completo)
     linhas = [l.strip() for l in bloco.splitlines()]
-
-    # remove cabeçalhos/linhas inúteis (igual ao script original)
-    ignorar = {
-        "Frente de Obra", "Classificação", "Função",
-        "Manhã", "Tarde", "Noite", "Em Operação", "Fiscalizado", "Geral", "Contratado"
-    }
-    linhas = [l for l in linhas if l and l not in ignorar and "TOTAL" not in l.upper()]
+    linhas = [l for l in linhas if l and l not in HEADERS_TO_IGNORE and "TOTAL" not in l.upper()]
 
     dados = []
     i = 0
-    while i < len(linhas) - 6:
-        # junta sequência de linhas estritamente numéricas
-        bloco_numeros = []
-        j = i
-        while j < len(linhas) and re.fullmatch(r"\d+", linhas[j]):
-            bloco_numeros.append(int(linhas[j]))
-            j += 1
+    while i < len(linhas):
+        if re.fullmatch(r"\d+", linhas[i]):  # começo de bloco numérico
+            nums = []
+            j = i
+            while j < len(linhas) and re.fullmatch(r"\d+", linhas[j]):
+                nums.append(int(linhas[j]))
+                j += 1
 
-        if len(bloco_numeros) >= 6:
-            # retrocede para achar a Classificação (Direto/Indireto),
-            # pega Frente na linha anterior e Função nas linhas entre a Classificação e os números
-            classificacao = ""
-            frente = ""
-            funcao_linhas = []
-            achou = False
-            for k in range(i - 1, -1, -1):
-                lk = linhas[k].strip()
-                if lk in ("Direto", "Indireto", "DIRETO", "INDIRETO"):
-                    classificacao = "Direto" if "DIRETO" in lk.upper() else "Indireto"
-                    frente = linhas[k - 1].strip() if k - 1 >= 0 else ""
-                    funcao_linhas = [x.strip() for x in linhas[k + 1:i] if x.strip()]
-                    achou = True
-                    break
-            # fallback se não achar
-            if not achou:
+            if len(nums) >= 6:
+                # backtracking para Classificação / Frente / Função
                 classificacao = ""
-                frente = "FRENTE DE OBRA ÚNICA"
-                funcao_linhas = [x.strip() for x in linhas[max(0, i - 3):i] if x.strip()]
+                frente = ""
+                funcao_linhas = []
+                achou = False
 
-            funcao = " ".join(funcao_linhas).strip() or (funcao_linhas[0] if funcao_linhas else "")
+                # conjunto de palavras que denotam classificação por tipo
+                if tipo == "Mão de Obra":
+                    class_words = {"Direto", "Indireto", "DIRETO", "INDIRETO"}
+                else:  # Equipamento
+                    class_words = {"Mecânico", "Elétrico", "MECANICO", "ELETRICO", "MECÂNICO", "ELÉTRICO"}
 
-            # pad para 7 números (contratado + 6 turnos)
-            while len(bloco_numeros) < 7:
-                bloco_numeros.append(0)
+                for k in range(i - 1, -1, -1):
+                    lk = linhas[k].strip()
+                    if lk in class_words:
+                        # normaliza Direto/Indireto/Mecânico/Elétrico
+                        up = _norm(lk)
+                        if "DIRETO" in up:
+                            classificacao = "Direto"
+                        elif "INDIRETO" in up:
+                            classificacao = "Indireto"
+                        elif "MECANICO" in up:
+                            classificacao = "Mecânico"
+                        elif "ELETRICO" in up:
+                            classificacao = "Elétrico"
+                        # frente = linha anterior se não for outra classificação
+                        if k > 0:
+                            ant = linhas[k - 1].strip()
+                            if ant not in class_words:
+                                frente = ant
+                        funcao_linhas = [x.strip() for x in linhas[k + 1:i] if x.strip()]
+                        achou = True
+                        break
 
-            dados.append({
-                "Função": funcao,
-                "Frente de Obra": frente,
-                "Classificação": classificacao,
-                "Contratado Geral": bloco_numeros[0],
-                "Em operação (manhã)": bloco_numeros[1],
-                "Fiscalizado (manhã)": bloco_numeros[2],
-                "Em operação (tarde)": bloco_numeros[3],
-                "Fiscalizado (tarde)": bloco_numeros[4],
-                "Em operação (noite)": bloco_numeros[5],
-                "Fiscalizado (noite)": bloco_numeros[6],
-            })
+                if not achou:
+                    frente = "FRENTE DE OBRA ÚNICA"
+                    funcao_linhas = [x.strip() for x in linhas[max(0, i - 3):i] if x.strip()]
 
-            i = j  # pula para depois do bloco numérico
+                funcao = " ".join(funcao_linhas).strip() if funcao_linhas else ""
+
+                # completa para 7 números
+                while len(nums) < 7:
+                    nums.append(0)
+
+                # mapeamento de colunas
+                if tipo == "Mão de Obra":
+                    contratado, eom, fm, eot, ft, eon, fn = nums[0:7]
+                else:  # Equipamento (ordem específica do seu script)
+                    contratado = nums[0]
+                    eom, fm, eot, ft, eon, fn = nums[5], nums[6], nums[3], nums[4], nums[1], nums[2]
+
+                dados.append({
+                    "Nome do Arquivo": nome_arquivo,
+                    "Data da RDO": data_rdo,
+                    "Tipo": tipo,
+                    "Função/Equipamento": funcao,
+                    "Frente de Obra": frente,
+                    "Classificação": classificacao,
+                    "Contratado Geral": contratado,
+                    "Em operação (manhã)": eom,
+                    "Fiscalizado (manhã)": fm,
+                    "Em operação (tarde)": eot,
+                    "Fiscalizado (tarde)": ft,
+                    "Em operação (noite)": eon,
+                    "Fiscalizado (noite)": fn,
+                })
+
+                i = j  # salta o bloco numérico
+            else:
+                i += 1
         else:
             i += 1
 
     return dados
 
-# ---------- Pipeline ----------
 def processar_arquivos(files):
     linhas, inconsistencias = [], []
     for f in files:
         try:
-            texto = _texto_pdf(f.read())
-            dados = _parse_bloco_mao_de_obra(texto)
-            if not dados:
-                inconsistencias.append({"Nome do Arquivo": f.name, "Linha": "[BLOCO NÃO ENCONTRADO OU SEM PADRÃO]"})
-            for row in dados:
-                row["Nome do Arquivo"] = f.name
-                linhas.append(row)
+            raw = f.read()
+            texto = _texto_pdf(raw)
+
+            # Mão de Obra
+            dados_mo = _parse_secao(texto, f.name, "Mão de Obra")
+            # Equipamentos
+            dados_eq = _parse_secao(texto, f.name, "Equipamento")
+
+            if not dados_mo and not dados_eq:
+                inconsistencias.append({"Nome do Arquivo": f.name, "Linha": "[BLOCOS NÃO ENCONTRADOS OU SEM PADRÃO]"})
+            else:
+                for row in (dados_mo or []):
+                    linhas.append(row)
+                for row in (dados_eq or []):
+                    linhas.append(row)
+
         except Exception as e:
             inconsistencias.append({"Nome do Arquivo": f.name, "Linha": f"[ERRO] {e}"})
 
     df = pd.DataFrame(linhas)
     cols_ordem = [
-        "Nome do Arquivo",
-        "Função",
-        "Frente de Obra",
-        "Classificação",
-        "Contratado Geral",
-        "Em operação (manhã)",
-        "Fiscalizado (manhã)",
-        "Em operação (tarde)",
-        "Fiscalizado (tarde)",
-        "Em operação (noite)",
-        "Fiscalizado (noite)",
+        "Nome do Arquivo", "Data da RDO", "Tipo", "Função/Equipamento", "Frente de Obra", "Classificação",
+        "Contratado Geral", "Em operação (manhã)", "Fiscalizado (manhã)",
+        "Em operação (tarde)", "Fiscalizado (tarde)",
+        "Em operação (noite)", "Fiscalizado (noite)"
     ]
     df = df[cols_ordem] if not df.empty else pd.DataFrame(columns=cols_ordem)
     df_incons = pd.DataFrame(inconsistencias)
     return df, df_incons
 
-# ---------- UI ----------
+# -------- UI --------
 col1, col2 = st.columns([1, 2])
 with col1:
     executar = st.button("🚀 Extrair", type="primary", use_container_width=True, disabled=not arquivos)
@@ -171,7 +238,7 @@ if executar:
         df, df_incons = processar_arquivos(arquivos)
 
     st.success("Extração concluída!")
-    st.subheader("Prévia dos dados")
+    st.subheader("Prévia dos dados (Mão de Obra + Equipamentos)")
     st.dataframe(df, use_container_width=True, hide_index=True)
 
     if not df_incons.empty:
@@ -181,17 +248,17 @@ if executar:
     # exporta
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="Mao_de_Obra", index=False)
+        df.to_excel(writer, sheet_name="Consolidado", index=False)
         if not df_incons.empty:
             df_incons.to_excel(writer, sheet_name="Inconsistencias", index=False)
 
     st.download_button(
         "💾 Baixar Excel",
         data=buffer.getvalue(),
-        file_name=f"{(nome_excel or 'rdo_consolidado').strip()}.xlsx",
+        file_name=f"{(nome_excel or 'RDO_CONSOLIDADO').strip()}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
 
 st.markdown("---")
-st.caption("Parser replica a lógica do app desktop (sequências de números em linhas separadas, com backtracking para Classificação/Frente/Função).")
+st.caption("Se algum arquivo ainda não vier, me envie 1 PDF exemplo (sem dados sensíveis) que ajusto as âncoras ou filtros.")
