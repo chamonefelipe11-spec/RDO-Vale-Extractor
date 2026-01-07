@@ -1,217 +1,303 @@
-import os
+# app.py
+# -*- coding: utf-8 -*-
+# Extrai RDO (Mão de Obra + Equipamentos) e consolida em um único Excel.
+# Compatível com Streamlit Cloud (sem tkinter).
+# Inclui correção: NÃO remover linhas que contenham "TOTAL" (ex.: "ESTAÇÃO TOTAL");
+# remove apenas se a linha for EXATAMENTE "TOTAL".
+
+import io
+import re
+import unicodedata
 import fitz  # PyMuPDF
 import pandas as pd
-import re
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
-from threading import Thread
+import streamlit as st
 
-def extrair_dados_por_posicao(texto_completo):
-    """
-    Extrai dados gerais do RDO (cabeçalho) usando a lógica de posições.
-    """
-    dados = {
-        "Data RDO": "Não encontrada",
-    }
+st.set_page_config(
+    page_title="Extrator RDO (Mão de Obra + Equipamentos)",
+    page_icon="🧰",
+    layout="wide",
+)
+
+st.title("🧰 Extrator de RDO (PDF → Excel)")
+st.caption(
+    "Consolida Mão de Obra + Equipamentos no mesmo Excel. "
+    "Correção aplicada: só remove a linha exatamente 'TOTAL' (mantém 'ESTAÇÃO TOTAL')."
+)
+
+with st.sidebar:
+    st.header("Entrada")
+    arquivos = st.file_uploader("Selecione 1 ou mais PDFs", type=["pdf"], accept_multiple_files=True)
+    nome_excel = st.text_input("Nome do arquivo Excel (sem extensão)", value="RDO_CONSOLIDADO")
+    st.markdown("---")
+    st.caption("Linhas fora do padrão vão para a aba **Inconsistencias**.")
+
+# -------- Utils --------
+def _texto_pdf(file_like: bytes) -> str:
+    with fitz.open(stream=file_like, filetype="pdf") as doc:
+        return "\n".join(page.get_text() for page in doc)
+
+def _norm(s: str) -> str:
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+    return s.upper()
+
+def extrair_data_rdo(texto_completo: str) -> str:
+    """Usa a linha 11 do arquivo (index 10) como data; fallback para dd/mm/aaaa no topo."""
     linhas = texto_completo.splitlines()
     try:
-        dados["Data RDO"] = linhas[10].strip()
-    except IndexError:
-        pass
-    return dados
+        data = linhas[10].strip()
+        return data if data else "Data não encontrada"
+    except Exception:
+        topo = "\n".join(linhas[:30]) if linhas else texto_completo[:1000]
+        m = re.search(r"\b(\d{2}/\d{2}/\d{4})\b", topo)
+        return m.group(1) if m else "Data não encontrada"
 
-def extrair_mao_de_obra(caminho_pdf):
-    try:
-        doc = fitz.open(caminho_pdf)
-        texto = "\n".join(pagina.get_text() for pagina in doc)
-        doc.close()
+def _recorta_bloco(texto: str, tipo: str) -> str | None:
+    """
+    Recorta trecho entre:
+      - Mão de Obra: 'RECURSOS EM OPERAÇÃO MÃO DE OBRA' → 'RECURSOS EM OPERAÇÃO EQUIPAMENTO'
+      - Equipamento: 'RECURSOS EM OPERAÇÃO EQUIPAMENTO' → 'ASSINATURAS' (ou fim se não achar)
+    Robusto a variações e acentos.
+    """
+    tnorm = _norm(texto)
 
-        dados_cabecalho = extrair_dados_por_posicao(texto)
-        data_rdo = dados_cabecalho.get("Data RDO", "Não encontrada")
+    if tipo == "Mão de Obra":
+        starts = [
+            "RECURSOS EM OPERACAO MAO DE OBRA",
+            "RECURSOS EM OPERACAO - MAO DE OBRA",
+            "RECURSOS DE OPERACAO MAO DE OBRA",
+        ]
+        ends = [
+            "RECURSOS EM OPERACAO EQUIPAMENTO",
+            "RECURSOS EM OPERACAO - EQUIPAMENTO",
+            "RECURSOS DE OPERACAO EQUIPAMENTO",
+        ]
+    else:  # Equipamento
+        starts = [
+            "RECURSOS EM OPERACAO EQUIPAMENTO",
+            "RECURSOS EM OPERACAO - EQUIPAMENTO",
+            "RECURSOS DE OPERACAO EQUIPAMENTO",
+        ]
+        ends = [
+            "ASSINATURAS",
+            "ASSINATURA",
+            "RESPONSAVEL",
+            "RESPONSÁVEL",
+            "OBSERVACOES",
+            "OBSERVAÇÕES",
+        ]
 
-        inicio = texto.find("RECURSOS EM OPERAÇÃO EQUIPAMENTO")
-        fim = texto.find("ASSINATURAS")
+    s = next((tnorm.find(x) for x in starts if tnorm.find(x) != -1), -1)
+    if s == -1:
+        return None
 
-        if inicio == -1 or fim == -1 or fim <= inicio:
-            return []
+    e = next((tnorm.find(x, s + 1) for x in ends if tnorm.find(x, s + 1) != -1), -1)
+    if e == -1 or e <= s:
+        e = len(tnorm)
 
-        bloco = texto[inicio:fim]
-        linhas_brutas = [l.strip() for l in bloco.splitlines()]
+    # mapeia de volta ao texto original (aproximação por proporção)
+    ratio = len(texto) / max(len(tnorm), 1)
+    return texto[int(s * ratio): int(e * ratio)]
 
-        # --- CORREÇÃO DO FILTRO AQUI ---
-        ignorar = {
-            "Classificação", "Função",
-            "Manhã", "Tarde", "Noite", "Em Operação", "Fiscalizado", "Geral", "Contratado"
-        }
-        
-        linhas = []
-        for l in linhas_brutas:
-            if not l: continue # Pula linhas vazias
-            if l in ignorar: continue # Pula palavras da lista ignorar
-            
-            # A CORREÇÃO:
-            # Antes você usava: if "TOTAL" in l.upper(): continue
-            # Isso apagava "ESTAÇÃO TOTAL". Agora só apagamos se a linha for EXATAMENTE "TOTAL"
-            if l.upper() == "TOTAL": 
-                continue
-                
-            linhas.append(l)
-        # -------------------------------
+# -------- Parser --------
+HEADERS_TO_IGNORE = {
+    "Frente de Obra", "Classificação", "Função",
+    "Manhã", "Tarde", "Noite", "Em Operação", "Fiscalizado", "Geral", "Contratado"
+}
 
-        dados = []
-        i = 0
-        while i < len(linhas) - 6:
-            bloco_numeros = []
+def _limpa_linhas(bloco: str) -> list[str]:
+    """Remove vazios, cabeçalhos e TOTAL (apenas quando for exatamente 'TOTAL')."""
+    linhas_brutas = [l.strip() for l in bloco.splitlines()]
+    out = []
+    for l in linhas_brutas:
+        if not l:
+            continue
+        if l in HEADERS_TO_IGNORE:
+            continue
+
+        # ✅ Correção: remove somente se a linha for EXATAMENTE "TOTAL"
+        if l.strip().upper() == "TOTAL":
+            continue
+
+        out.append(l)
+    return out
+
+def _parse_secao(texto_completo: str, nome_arquivo: str, tipo: str) -> list[dict]:
+    bloco = _recorta_bloco(texto_completo, tipo)
+    if not bloco:
+        return []
+
+    data_rdo = extrair_data_rdo(texto_completo)
+    linhas = _limpa_linhas(bloco)
+
+    dados = []
+    i = 0
+    while i < len(linhas):
+        # detecta começo do bloco numérico
+        if re.fullmatch(r"\d+", linhas[i]):
+            nums = []
             j = i
-            # Identifica o bloco de números (quantidades)
-            while j < len(linhas) and re.fullmatch(r'\d+', linhas[j]):
-                bloco_numeros.append(int(linhas[j]))
+            while j < len(linhas) and re.fullmatch(r"\d+", linhas[j]):
+                nums.append(int(linhas[j]))
                 j += 1
 
-            if len(bloco_numeros) >= 6:
+            if len(nums) >= 6:
                 classificacao = ""
                 frente = ""
                 funcao_linhas = []
-                
-                # Varre para trás para achar a Classificação
+                achou = False
+
+                if tipo == "Mão de Obra":
+                    class_words = {"DIRETO", "INDIRETO"}
+                else:  # Equipamento
+                    class_words = {"MECANICO", "ELETRICO", "MECÂNICO", "ELÉTRICO"}
+
+                # backtracking para achar classificação e frente
                 for k in range(i - 1, -1, -1):
-                    linha = linhas[k]
-                    if linha in ("Direto", "Indireto"):
-                        classificacao = linha
-                        
-                        # Tenta pegar a Frente de Obra
-                        if k - 1 >= 0:
-                            idx_frente = k - 1
-                            # Pula números perdidos acima da classificação
-                            while idx_frente >= 0 and re.fullmatch(r'\d+', linhas[idx_frente]):
-                                idx_frente -= 1
-                            frente = linhas[idx_frente] if idx_frente >= 0 else ""
-                        
-                        # Captura o nome do equipamento
-                        # Tenta pegar entre a classificação e os números
-                        funcao_linhas = linhas[k + 1:i]
-                        texto_teste = " ".join(funcao_linhas).strip()
-                        
-                        # Se estiver vazio (ou só números), faz o backtracking (recurso de segurança)
-                        if not texto_teste or re.fullmatch(r'\d+', texto_teste):
-                            for m in range(k - 1, -1, -1):
-                                linha_candidata = linhas[m]
-                                if linha_candidata in ("Direto", "Indireto"): break
-                                if "FRENTE DE OBRA" in linha_candidata.upper(): continue
-                                if re.fullmatch(r'\d+', linha_candidata): continue # Pula o '0' isolado
-                                
-                                funcao_linhas = [linha_candidata]
-                                break
-                        
+                    lk = linhas[k].strip()
+                    upk = _norm(lk)
+
+                    if upk in class_words:
+                        if "DIRETO" in upk:
+                            classificacao = "Direto"
+                        elif "INDIRETO" in upk:
+                            classificacao = "Indireto"
+                        elif "MECANICO" in upk:
+                            classificacao = "Mecânico"
+                        elif "ELETRICO" in upk:
+                            classificacao = "Elétrico"
+
+                        # frente tende a estar logo acima; pula números “perdidos”
+                        idx_frente = k - 1
+                        while idx_frente >= 0 and re.fullmatch(r"\d+", linhas[idx_frente]):
+                            idx_frente -= 1
+                        if idx_frente >= 0:
+                            frente = linhas[idx_frente].strip()
+
+                        funcao_linhas = [x.strip() for x in linhas[k + 1:i] if x.strip()]
+                        achou = True
                         break
 
-                funcao = " ".join(funcao_linhas).strip()
+                if not achou:
+                    frente = "FRENTE DE OBRA ÚNICA"
+                    funcao_linhas = [x.strip() for x in linhas[max(0, i - 3):i] if x.strip()]
 
-                while len(bloco_numeros) < 7:
-                    bloco_numeros.append(0)
+                funcao = " ".join(funcao_linhas).strip() if funcao_linhas else ""
+
+                # completa para 7 números
+                while len(nums) < 7:
+                    nums.append(0)
+
+                # mapeamento
+                if tipo == "Mão de Obra":
+                    contratado, eom, fm, eot, ft, eon, fn = nums[0:7]
+                else:  # Equipamento (ordem específica)
+                    contratado = nums[0]
+                    eom, fm, eot, ft, eon, fn = nums[5], nums[6], nums[3], nums[4], nums[1], nums[2]
 
                 dados.append({
-                    "Nome do Arquivo": os.path.basename(caminho_pdf),
+                    "Nome do Arquivo": nome_arquivo,
                     "Data da RDO": data_rdo,
-                    "Função": funcao, # Nome do Equipamento
+                    "Tipo": tipo,
+                    "Função/Equipamento": funcao,
                     "Frente de Obra": frente,
                     "Classificação": classificacao,
-                    "Contratado Geral": bloco_numeros[0],
-                    "Em operação (manhã)": bloco_numeros[5],
-                    "Fiscalizado (manhã)": bloco_numeros[6],
-                    "Em operação (tarde)": bloco_numeros[3],
-                    "Fiscalizado (tarde)": bloco_numeros[4],
-                    "Em operação (noite)": bloco_numeros[1],
-                    "Fiscalizado (noite)": bloco_numeros[2],
+                    "Contratado Geral": contratado,
+                    "Em operação (manhã)": eom,
+                    "Fiscalizado (manhã)": fm,
+                    "Em operação (tarde)": eot,
+                    "Fiscalizado (tarde)": ft,
+                    "Em operação (noite)": eon,
+                    "Fiscalizado (noite)": fn,
                 })
 
                 i = j
             else:
                 i += 1
+        else:
+            i += 1
 
-        return dados
+    return dados
 
-    except Exception as e:
-        print(f"Erro ao processar {caminho_pdf}: {e}")
-        return []
+def processar_arquivos(files):
+    linhas, inconsistencias = [], []
 
-def processar_pasta(pasta_origem, pasta_destino, nome_arquivo, barra_progresso, botao):
-    todos_dados = []
-    arquivos_pdf = [
-        os.path.join(raiz, arquivo)
-        for raiz, _, arquivos in os.walk(pasta_origem)
-        for arquivo in arquivos if arquivo.lower().endswith('.pdf')
+    for f in files:
+        try:
+            raw = f.read()
+            texto = _texto_pdf(raw)
+
+            dados_mo = _parse_secao(texto, f.name, "Mão de Obra")
+            dados_eq = _parse_secao(texto, f.name, "Equipamento")
+
+            if not dados_mo and not dados_eq:
+                inconsistencias.append({
+                    "Nome do Arquivo": f.name,
+                    "Linha": "[BLOCOS NÃO ENCONTRADOS OU SEM PADRÃO]"
+                })
+            else:
+                linhas.extend(dados_mo)
+                linhas.extend(dados_eq)
+
+        except Exception as e:
+            inconsistencias.append({"Nome do Arquivo": f.name, "Linha": f"[ERRO] {e}"})
+
+    cols_ordem = [
+        "Nome do Arquivo", "Data da RDO", "Tipo", "Função/Equipamento",
+        "Frente de Obra", "Classificação",
+        "Contratado Geral",
+        "Em operação (manhã)", "Fiscalizado (manhã)",
+        "Em operação (tarde)", "Fiscalizado (tarde)",
+        "Em operação (noite)", "Fiscalizado (noite)",
     ]
 
-    total = len(arquivos_pdf)
-    for idx, caminho_pdf in enumerate(arquivos_pdf, 1):
-        dados = extrair_mao_de_obra(caminho_pdf)
-        todos_dados.extend(dados)
-        barra_progresso["value"] = (idx / total) * 100
-        barra_progresso.update()
-
-    if todos_dados:
-        df = pd.DataFrame(todos_dados)
-        colunas = [
-            "Nome do Arquivo", "Data da RDO", "Função", "Frente de Obra", "Classificação",
-            "Contratado Geral", "Em operação (manhã)", "Fiscalizado (manhã)",
-            "Em operação (tarde)", "Fiscalizado (tarde)",
-            "Em operação (noite)", "Fiscalizado (noite)"
-        ]
-        df = df[colunas]
-        df.to_excel(os.path.join(pasta_destino, f"{nome_arquivo}.xlsx"), index=False)
-        messagebox.showinfo("Concluído", "Planilha gerada com sucesso!")
+    df = pd.DataFrame(linhas)
+    if df.empty:
+        df = pd.DataFrame(columns=cols_ordem)
     else:
-        messagebox.showwarning("Aviso", "Nenhum dado encontrado.")
+        df = df[cols_ordem]
 
-    botao["state"] = "normal"
-    barra_progresso["value"] = 0
+    df_incons = pd.DataFrame(inconsistencias)
+    return df, df_incons
 
-def iniciar_interface():
-    def selecionar_origem():
-        pasta = filedialog.askdirectory()
-        entrada_origem.delete(0, tk.END)
-        entrada_origem.insert(0, pasta)
+# -------- UI --------
+col1, col2 = st.columns([1, 2])
+with col1:
+    executar = st.button(
+        "🚀 Extrair",
+        type="primary",
+        use_container_width=True,
+        disabled=not arquivos,
+    )
+with col2:
+    if arquivos:
+        st.info(f"{len(arquivos)} arquivo(s) selecionado(s).")
 
-    def selecionar_destino():
-        pasta = filedialog.askdirectory()
-        entrada_destino.delete(0, tk.END)
-        entrada_destino.insert(0, pasta)
+if executar:
+    with st.spinner("Processando PDFs..."):
+        df, df_incons = processar_arquivos(arquivos)
 
-    def iniciar():
-        origem = entrada_origem.get()
-        destino = entrada_destino.get()
-        nome = entrada_nome.get().strip()
-        if not origem or not destino or not nome:
-            messagebox.showerror("Erro", "Todos os campos devem ser preenchidos.")
-            return
-        botao_executar["state"] = "disabled"
-        Thread(target=processar_pasta, args=(origem, destino, nome, barra, botao_executar)).start()
+    st.success("Extração concluída!")
+    st.subheader("Prévia dos dados (Mão de Obra + Equipamentos)")
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
-    root = tk.Tk()
-    root.title("Extrator de Mão de Obra e Equipamentos - RDO")
+    if not df_incons.empty:
+        with st.expander("Inconsistências / linhas não parseadas"):
+            st.dataframe(df_incons, use_container_width=True, hide_index=True)
 
-    tk.Label(root, text="📁 Pasta com PDFs:").grid(row=0, column=0, sticky="w")
-    entrada_origem = tk.Entry(root, width=50)
-    entrada_origem.grid(row=0, column=1)
-    tk.Button(root, text="Selecionar", command=selecionar_origem).grid(row=0, column=2)
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="Consolidado", index=False)
+        if not df_incons.empty:
+            df_incons.to_excel(writer, sheet_name="Inconsistencias", index=False)
 
-    tk.Label(root, text="📂 Pasta para salvar:").grid(row=1, column=0, sticky="w")
-    entrada_destino = tk.Entry(root, width=50)
-    entrada_destino.grid(row=1, column=1)
-    tk.Button(root, text="Selecionar", command=selecionar_destino).grid(row=1, column=2)
+    st.download_button(
+        "💾 Baixar Excel",
+        data=buffer.getvalue(),
+        file_name=f"{(nome_excel or 'RDO_CONSOLIDADO').strip()}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
 
-    tk.Label(root, text="📝 Nome do Excel:").grid(row=2, column=0, sticky="w")
-    entrada_nome = tk.Entry(root, width=50)
-    entrada_nome.grid(row=2, column=1, columnspan=2)
-
-    barra = ttk.Progressbar(root, orient="horizontal", length=400, mode="determinate")
-    barra.grid(row=3, column=0, columnspan=3, pady=10)
-
-    botao_executar = tk.Button(root, text="Iniciar Extração", command=iniciar)
-    botao_executar.grid(row=4, column=0, columnspan=3, pady=5)
-
-    root.mainloop()
-
-if __name__ == "__main__":
-    iniciar_interface()
+st.markdown("---")
+st.caption("Se algum PDF específico não vier, envie 1 exemplo (sem dados sensíveis) e eu ajusto as âncoras/filtros.")
