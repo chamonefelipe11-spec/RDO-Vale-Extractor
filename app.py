@@ -4,6 +4,11 @@
 # Compatível com Streamlit Cloud (sem tkinter).
 # Inclui correção: NÃO remover linhas que contenham "TOTAL" (ex.: "ESTAÇÃO TOTAL");
 # remove apenas se a linha for EXATAMENTE "TOTAL".
+#
+# ✅ Correção solicitada (aplicada):
+# Para a seção "Equipamento", o parser agora reconhece também "DIRETO/INDIRETO"
+# (além de "MECÂNICO/ELÉTRICO"), evitando juntar "Indireto" e "Frente de Obra"
+# dentro de "Função/Equipamento".
 
 import io
 import re
@@ -31,15 +36,18 @@ with st.sidebar:
     st.markdown("---")
     st.caption("Linhas fora do padrão vão para a aba **Inconsistencias**.")
 
+
 # -------- Utils --------
 def _texto_pdf(file_like: bytes) -> str:
     with fitz.open(stream=file_like, filetype="pdf") as doc:
         return "\n".join(page.get_text() for page in doc)
 
+
 def _norm(s: str) -> str:
     s = unicodedata.normalize("NFD", s)
     s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
     return s.upper()
+
 
 def extrair_data_rdo(texto_completo: str) -> str:
     """Usa a linha 11 do arquivo (index 10) como data; fallback para dd/mm/aaaa no topo."""
@@ -51,6 +59,7 @@ def extrair_data_rdo(texto_completo: str) -> str:
         topo = "\n".join(linhas[:30]) if linhas else texto_completo[:1000]
         m = re.search(r"\b(\d{2}/\d{2}/\d{4})\b", topo)
         return m.group(1) if m else "Data não encontrada"
+
 
 def _recorta_bloco(texto: str, tipo: str) -> str | None:
     """
@@ -99,11 +108,13 @@ def _recorta_bloco(texto: str, tipo: str) -> str | None:
     ratio = len(texto) / max(len(tnorm), 1)
     return texto[int(s * ratio): int(e * ratio)]
 
+
 # -------- Parser --------
 HEADERS_TO_IGNORE = {
     "Frente de Obra", "Classificação", "Função",
     "Manhã", "Tarde", "Noite", "Em Operação", "Fiscalizado", "Geral", "Contratado"
 }
+
 
 def _limpa_linhas(bloco: str) -> list[str]:
     """Remove vazios, cabeçalhos e TOTAL (apenas quando for exatamente 'TOTAL')."""
@@ -121,6 +132,7 @@ def _limpa_linhas(bloco: str) -> list[str]:
 
         out.append(l)
     return out
+
 
 def _parse_secao(texto_completo: str, nome_arquivo: str, tipo: str) -> list[dict]:
     bloco = _recorta_bloco(texto_completo, tipo)
@@ -150,7 +162,10 @@ def _parse_secao(texto_completo: str, nome_arquivo: str, tipo: str) -> list[dict
                 if tipo == "Mão de Obra":
                     class_words = {"DIRETO", "INDIRETO"}
                 else:  # Equipamento
-                    class_words = {"MECANICO", "ELETRICO", "MECÂNICO", "ELÉTRICO"}
+                    # ✅ CORREÇÃO AQUI:
+                    # Equipamento também pode vir como Direto/Indireto (como no seu caso),
+                    # além de alguns modelos que usam Mecânico/Elétrico.
+                    class_words = {"DIRETO", "INDIRETO", "MECANICO", "ELETRICO", "MECÂNICO", "ELÉTRICO"}
 
                 # backtracking para achar classificação e frente
                 for k in range(i - 1, -1, -1):
@@ -219,6 +234,7 @@ def _parse_secao(texto_completo: str, nome_arquivo: str, tipo: str) -> list[dict
 
     return dados
 
+
 def processar_arquivos(files):
     linhas, inconsistencias = [], []
 
@@ -259,6 +275,7 @@ def processar_arquivos(files):
 
     df_incons = pd.DataFrame(inconsistencias)
     return df, df_incons
+
 
 # -------- UI --------
 col1, col2 = st.columns([1, 2])
