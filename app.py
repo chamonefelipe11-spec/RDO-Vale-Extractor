@@ -60,37 +60,6 @@ def extrair_data_rdo(texto_completo: str) -> str:
         m = re.search(r"\b(\d{2}/\d{2}/\d{4})\b", topo)
         return m.group(1) if m else "Data não encontrada"
 
-def extrair_pluviometria_e_numero(texto_completo: str) -> dict:
-    """
-    Extrai Número RDO + Data + Pluviometria manhã/tarde
-    usando a MESMA lógica do código 2 (Colab).
-    """
-    dados = {
-        "Número RDO": "Não encontrado",
-        "Data RDO": "Não encontrada",
-        "Pluviometria Manhã": "Não encontrada",
-        "Pluviometria Tarde": "Não encontrada",
-    }
-
-    linhas = texto_completo.splitlines()
-
-    # reaproveita sua função de data
-    dados["Data RDO"] = extrair_data_rdo(texto_completo)
-
-    try:
-        idx_status = linhas.index("Status :")
-        dados["Número RDO"] = linhas[idx_status - 2].strip()
-    except (ValueError, IndexError):
-        pass
-
-    try:
-        idx_num_rdo = linhas.index("Número RDO :")
-        dados["Pluviometria Manhã"] = linhas[idx_num_rdo - 3].strip()
-        dados["Pluviometria Tarde"] = linhas[idx_num_rdo - 2].strip()
-    except (ValueError, IndexError):
-        pass
-
-    return dados
 
 def _recorta_bloco(texto: str, tipo: str) -> str | None:
     """
@@ -268,26 +237,14 @@ def _parse_secao(texto_completo: str, nome_arquivo: str, tipo: str) -> list[dict
 
 def processar_arquivos(files):
     linhas, inconsistencias = [], []
-    pluv_rows = []
 
     for f in files:
         try:
             raw = f.read()
             texto = _texto_pdf(raw)
 
-            # 🔹 SEU CÓDIGO ORIGINAL (intacto)
             dados_mo = _parse_secao(texto, f.name, "Mão de Obra")
             dados_eq = _parse_secao(texto, f.name, "Equipamento")
-
-            # 🔹 NOVO: pluviometria
-            pluv = extrair_pluviometria_e_numero(texto)
-            pluv_rows.append({
-                "Nome do Arquivo": f.name,
-                "Data RDO": pluv["Data RDO"],
-                "Número RDO": pluv["Número RDO"],
-                "Pluviometria Manhã": pluv["Pluviometria Manhã"],
-                "Pluviometria Tarde": pluv["Pluviometria Tarde"],
-            })
 
             if not dados_mo and not dados_eq:
                 inconsistencias.append({
@@ -299,10 +256,7 @@ def processar_arquivos(files):
                 linhas.extend(dados_eq)
 
         except Exception as e:
-            inconsistencias.append({
-                "Nome do Arquivo": f.name,
-                "Linha": f"[ERRO] {e}"
-            })
+            inconsistencias.append({"Nome do Arquivo": f.name, "Linha": f"[ERRO] {e}"})
 
     cols_ordem = [
         "Nome do Arquivo", "Data da RDO", "Tipo", "Função/Equipamento",
@@ -320,11 +274,7 @@ def processar_arquivos(files):
         df = df[cols_ordem]
 
     df_incons = pd.DataFrame(inconsistencias)
-
-    df_pluv = pd.DataFrame(pluv_rows)
-
-    return df, df_incons, df_pluv
-
+    return df, df_incons
 
 
 # -------- UI --------
@@ -342,14 +292,11 @@ with col2:
 
 if executar:
     with st.spinner("Processando PDFs..."):
-        df, df_incons, df_pluv = processar_arquivos(arquivos)
+        df, df_incons = processar_arquivos(arquivos)
 
     st.success("Extração concluída!")
     st.subheader("Prévia dos dados (Mão de Obra + Equipamentos)")
     st.dataframe(df, use_container_width=True, hide_index=True)
-    st.subheader("🌧️ Prévia da Pluviometria")
-    st.dataframe(df_pluv, use_container_width=True, hide_index=True)
-
 
     if not df_incons.empty:
         with st.expander("Inconsistências / linhas não parseadas"):
@@ -357,11 +304,9 @@ if executar:
 
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-    df.to_excel(writer, sheet_name="Consolidado", index=False)
-    df_pluv.to_excel(writer, sheet_name="Pluviometria", index=False)
-    if not df_incons.empty:
-        df_incons.to_excel(writer, sheet_name="Inconsistencias", index=False)
-
+        df.to_excel(writer, sheet_name="Consolidado", index=False)
+        if not df_incons.empty:
+            df_incons.to_excel(writer, sheet_name="Inconsistencias", index=False)
 
     st.download_button(
         "💾 Baixar Excel",
@@ -373,4 +318,3 @@ if executar:
 
 st.markdown("---")
 st.caption("Se algum PDF específico não vier, envie 1 exemplo (sem dados sensíveis) e eu ajusto as âncoras/filtros.")
-
