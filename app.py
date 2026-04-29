@@ -1,132 +1,5 @@
-# app.py
-# -*- coding: utf-8 -*-
-# Extrai RDO (Mão de Obra + Equipamentos) e consolida em um único Excel.
-# Compatível com Streamlit Cloud (sem tkinter).
-# Inclui correção: NÃO remover linhas que contenham "TOTAL" (ex.: "ESTAÇÃO TOTAL");
-# remove apenas se a linha for EXATAMENTE "TOTAL".
-#
-# ✅ Correção solicitada (aplicada):
-# Para a seção "Equipamento", o parser agora reconhece também "DIRETO/INDIRETO"
-# (além de "MECÂNICO/ELÉTRICO"), evitando juntar "Indireto" e "Frente de Obra"
-# dentro de "Função/Equipamento".
 
-import io
-import re
-import unicodedata
-import fitz  # PyMuPDF
-import pandas as pd
-import streamlit as st
-
-st.set_page_config(
-    page_title="Extrator RDO (Mão de Obra + Equipamentos)",
-    page_icon="🧰",
-    layout="wide",
-)
-
-st.title("🧰 Extrator de RDO (PDF → Excel)")
-st.caption(
-    "Consolida Mão de Obra + Equipamentos no mesmo Excel. "
-    "Correção aplicada: só remove a linha exatamente 'TOTAL' (mantém 'ESTAÇÃO TOTAL')."
-)
-
-with st.sidebar:
-    st.header("Entrada")
-    arquivos = st.file_uploader("Selecione 1 ou mais PDFs", type=["pdf"], accept_multiple_files=True)
-    nome_excel = st.text_input("Nome do arquivo Excel (sem extensão)", value="RDO_CONSOLIDADO")
-    st.markdown("---")
-    st.caption("Linhas fora do padrão vão para a aba **Inconsistencias**.")
-
-
-# -------- Utils --------
-def _texto_pdf(file_like: bytes) -> str:
-    with fitz.open(stream=file_like, filetype="pdf") as doc:
-        return "\n".join(page.get_text() for page in doc)
-
-
-def _norm(s: str) -> str:
-    s = unicodedata.normalize("NFD", s)
-    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
-    return s.upper()
-
-
-def extrair_data_rdo(texto_completo: str) -> str:
-    """Usa a linha 11 do arquivo (index 10) como data; fallback para dd/mm/aaaa no topo."""
-    linhas = texto_completo.splitlines()
-    try:
-        data = linhas[10].strip()
-        return data if data else "Data não encontrada"
-    except Exception:
-        topo = "\n".join(linhas[:30]) if linhas else texto_completo[:1000]
-        m = re.search(r"\b(\d{2}/\d{2}/\d{4})\b", topo)
-        return m.group(1) if m else "Data não encontrada"
-
-
-def _recorta_bloco(texto: str, tipo: str) -> str | None:
-    """
-    Recorta trecho entre:
-      - Mão de Obra: 'RECURSOS EM OPERAÇÃO MÃO DE OBRA' → 'RECURSOS EM OPERAÇÃO EQUIPAMENTO'
-      - Equipamento: 'RECURSOS EM OPERAÇÃO EQUIPAMENTO' → 'ASSINATURAS' (ou fim se não achar)
-    Robusto a variações e acentos.
-    """
-    tnorm = _norm(texto)
-
-    if tipo == "Mão de Obra":
-        starts = [
-            "RECURSOS EM OPERACAO MAO DE OBRA",
-            "RECURSOS EM OPERACAO - MAO DE OBRA",
-            "RECURSOS DE OPERACAO MAO DE OBRA",
-        ]
-        ends = [
-            "RECURSOS EM OPERACAO EQUIPAMENTO",
-            "RECURSOS EM OPERACAO - EQUIPAMENTO",
-            "RECURSOS DE OPERACAO EQUIPAMENTO",
-        ]
-    else:  # Equipamento
-        starts = [
-            "RECURSOS EM OPERACAO EQUIPAMENTO",
-            "RECURSOS EM OPERACAO - EQUIPAMENTO",
-            "RECURSOS DE OPERACAO EQUIPAMENTO",
-        ]
-        ends = [
-            "ASSINATURAS",
-            "ASSINATURA",
-            "RESPONSAVEL",
-            "RESPONSÁVEL",
-            "OBSERVACOES",
-            "OBSERVAÇÕES",
-        ]
-
-    s = next((tnorm.find(x) for x in starts if tnorm.find(x) != -1), -1)
-    if s == -1:
-        return None
-
-    e = next((tnorm.find(x, s + 1) for x in ends if tnorm.find(x, s + 1) != -1), -1)
-    if e == -1 or e <= s:
-        e = len(tnorm)
-
-    # mapeia de volta ao texto original (aproximação por proporção)
-    ratio = len(texto) / max(len(tnorm), 1)
-    return texto[int(s * ratio): int(e * ratio)]
-
-
-# -------- Parser --------
-HEADERS_TO_IGNORE = {
-    "Frente de Obra", "Classificação", "Função",
-    "Manhã", "Tarde", "Noite", "Em Operação", "Fiscalizado", "Geral", "Contratado"
-}
-
-
-def _limpa_linhas(bloco: str) -> list[str]:
-    """Remove vazios, cabeçalhos e TOTAL (apenas quando for exatamente 'TOTAL')."""
-    linhas_brutas = [l.strip() for l in bloco.splitlines()]
-    out = []
-    for l in linhas_brutas:
-        if not l:
-            continue
-        if l in HEADERS_TO_IGNORE:
-            continue
-
-        # ✅ Correção: remove somente se a linha for EXATAMENTE "TOTAL"
+        # Remove somente se a linha for EXATAMENTE "TOTAL"
         if l.strip().upper() == "TOTAL":
             continue
 
@@ -159,28 +32,11 @@ def _parse_secao(texto_completo: str, nome_arquivo: str, tipo: str) -> list[dict
                 funcao_linhas = []
                 achou = False
 
-                if tipo == "Mão de Obra":
-                    class_words = {"DIRETO", "INDIRETO"}
-                else:  # Equipamento
-                    # ✅ CORREÇÃO AQUI:
-                    # Equipamento também pode vir como Direto/Indireto (como no seu caso),
-                    # além de alguns modelos que usam Mecânico/Elétrico.
-                    class_words = {"DIRETO", "INDIRETO", "MECANICO", "ELETRICO", "MECÂNICO", "ELÉTRICO"}
-
                 # backtracking para achar classificação e frente
                 for k in range(i - 1, -1, -1):
-                    lk = linhas[k].strip()
-                    upk = _norm(lk)
-
-                    if upk in class_words:
-                        if "DIRETO" in upk:
-                            classificacao = "Direto"
-                        elif "INDIRETO" in upk:
-                            classificacao = "Indireto"
-                        elif "MECANICO" in upk:
-                            classificacao = "Mecânico"
-                        elif "ELETRICO" in upk:
-                            classificacao = "Elétrico"
+                    classificacao_encontrada = _label_classificacao(linhas[k], tipo)
+                    if classificacao_encontrada:
+                        classificacao = classificacao_encontrada
 
                         # frente tende a estar logo acima; pula números “perdidos”
                         idx_frente = k - 1
