@@ -20,12 +20,12 @@ import pandas as pd
 import streamlit as st
 
 st.set_page_config(
-    page_title="Hub de Parsers RDO",
+    page_title="Hub de Parsers RDO VALE",
     page_icon="🧰",
     layout="wide",
 )
 
-st.title("🧰 Hub de Parsers de RDO (PDF → Excel)")
+st.title("🧰 Hub de Parsers de RDO VALE (PDF → Excel)")
 
 with st.sidebar:
     st.header("Parser")
